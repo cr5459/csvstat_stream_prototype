@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-import csv, sys, os, math, argparse, random, subprocess, hashlib, bisect, time
+import csv, sys, os, math, argparse, random, subprocess, hashlib, bisect, time, re
 from typing import List, Tuple, Optional
 
+# optional psutil (restored)
 try:
-    import psutil  # optional
+    import psutil  # type: ignore
 except Exception:
     psutil = None
+
+# --- performance additions ---
+try:
+    import xxhash  # optional fast hash
+    def _fast_hash64(val: str) -> int:
+        return xxhash.xxh64(val).intdigest()  # 64-bit
+except Exception:  # fallback
+    def _fast_hash64(val: str) -> int:
+        return int.from_bytes(hashlib.blake2b(val.encode('utf-8','ignore'), digest_size=8).digest(), 'big')
+
+_NUM_RE = re.compile(r'^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+-]?\d+)?$')
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -26,12 +38,12 @@ def total_ram_bytes() -> int:
 # ---- Unique (KMV) estimator ----
 class KMVEstimator:
     __slots__ = ("k", "_exact", "_hashes")
-    def __init__(self, k: int = 1024):
+    def __init__(self, k: int = 256):  # reduced k for speed
         self.k = k
         self._exact: Optional[set] = set()
         self._hashes: List[int] = []
     def _hash64(self, val: str) -> int:
-        return int.from_bytes(hashlib.blake2b(val.encode('utf-8','ignore'), digest_size=8).digest(), 'big')
+        return _fast_hash64(val)
     def add(self, val: str):
         if self._exact is not None:
             self._exact.add(val)
@@ -66,8 +78,8 @@ class KMVEstimator:
 
 # ---- Running numeric/text stats ----
 class RunningStats:
-    __slots__ = ("n","nn","nulls","mean","M2","min","max","sum","max_decimals","longest_len","is_numeric","res_sample","res_k","unique","value_counts","heavy","_heavy_k")
-    def __init__(self, res_k: int = 2048, heavy_k: int = 10):
+    __slots__ = ("n","nn","nulls","mean","M2","min","max","sum","max_decimals","longest_len","is_numeric","unique")
+    def __init__(self):
         self.n = 0
         self.nn = 0
         self.nulls = 0
@@ -79,88 +91,42 @@ class RunningStats:
         self.max_decimals = 0
         self.longest_len = 0
         self.is_numeric = True
-        self.res_sample: List[float] = []
-        self.res_k = res_k
-        self.unique = KMVEstimator(k=1024)
-        self.value_counts: Optional[dict] = {}  # exact until >5k uniques
-        self.heavy = {}  # Misra-Gries approximate heavy hitters
-        self._heavy_k = heavy_k
-    def _heavy_add(self, val: str):
-        if val in self.heavy:
-            self.heavy[val] += 1
-            return
-        if len(self.heavy) < self._heavy_k:
-            self.heavy[val] = 1
-        else:
-            drop = []
-            for k in self.heavy:
-                self.heavy[k] -= 1
-                if self.heavy[k] == 0:
-                    drop.append(k)
-            for k in drop:
-                del self.heavy[k]
-    def _reservoir_add(self, x: float):
-        if len(self.res_sample) < self.res_k:
-            self.res_sample.append(x)
-        else:
-            # Reservoir sampling replacement
-            if random.random() < self.res_k / self.nn:
-                idx = random.randint(0, self.res_k - 1)
-                self.res_sample[idx] = x
-    def _count_value(self, val: str):
-        vc = self.value_counts
-        if vc is not None:
-            vc[val] = vc.get(val, 0) + 1
-            if len(vc) > 5000:  # switch off exact counting
-                self.value_counts = None  # fallback to heavy hitters only
-        # Always feed heavy hitters (gives approximate top values even after cutoff)
-        self._heavy_add(val)
+        self.unique = KMVEstimator(k=256)
     def add_cell(self, cell: str):
         self.n += 1
         if cell == "":
             self.nulls += 1
-            self._count_value("None")
             self.unique.add("None")
             return
-        # Try numeric first
-        try:
-            x = float(cell)
-            # Numeric branch
-            self.nn += 1
-            if x < self.min: self.min = x
-            if x > self.max: self.max = x
-            d = x - self.mean
-            self.mean += d / self.nn
-            self.M2 += d * (x - self.mean)
-            self.sum += x
-            # Track decimal places (raw cell string)
-            if "." in cell:
-                decs = len(cell.rsplit(".",1)[1].rstrip("0"))
-                if decs > self.max_decimals:
-                    self.max_decimals = decs
-            self._count_value(cell)
-            self.unique.add(cell)
-            self._reservoir_add(x)
-        except ValueError:
-            # Non-numeric; mark column as mixed/text
-            self.is_numeric = False
-            l = len(cell)
-            if l > self.longest_len:
-                self.longest_len = l
-            self._count_value(cell)
-            self.unique.add(cell)
-    def _median(self) -> Optional[float]:
-        if self.nn == 0 or not self.res_sample:
-            return None
-        # approximate median from reservoir sample
-        s = sorted(self.res_sample)
-        m = len(s)
-        return s[m//2] if m % 2 == 1 else 0.5 * (s[m//2 -1] + s[m//2])
+        # Fast numeric path (avoid exceptions):
+        if self.is_numeric and _NUM_RE.match(cell):
+            try:
+                x = float(cell)
+            except ValueError:  # extremely rare given regex
+                self.is_numeric = False
+            else:
+                self.nn += 1
+                if x < self.min: self.min = x
+                if x > self.max: self.max = x
+                d = x - self.mean
+                self.mean += d / self.nn
+                self.M2 += d * (x - self.mean)
+                self.sum += x
+                if "." in cell:
+                    decs = len(cell.rsplit(".",1)[1].rstrip("0"))
+                    if decs > self.max_decimals:
+                        self.max_decimals = decs
+                self.unique.add(cell)
+                return
+        # Text / mixed fallback
+        self.is_numeric = False
+        l = len(cell)
+        if l > self.longest_len:
+            self.longest_len = l
+        self.unique.add(cell)
     def result(self) -> dict:
         stdev = math.sqrt(self.M2 / (self.nn - 1)) if self.nn > 1 else None
         uniq_est, uniq_exact = self.unique.estimate()
-        median_val = self._median()
-        median_exact = (self.nn > 0 and self.nn <= self.res_k and self.is_numeric)
         return {
             "count": self.n,
             "non_null_numeric": self.nn,
@@ -175,10 +141,6 @@ class RunningStats:
             "is_numeric": self.is_numeric and self.nn > 0,
             "unique": uniq_est,
             "unique_exact": uniq_exact,
-            "median": median_val,
-            "median_exact": median_exact,
-            "value_counts": self.value_counts,
-            "heavy": dict(self.heavy),
         }
 
 def sample_avg_row_bytes(path: str, n: int = 50_000, seed: int = 1337) -> Tuple[float, int]:
@@ -296,7 +258,7 @@ def main():
         print(f"Mode: STREAM — stdin | reason=no size available | seed={args.seed}")
         headers, results = stream_stats_filelike(sys.stdin)
         print_stream_results(headers, results)
-        print("\nNote: STREAM mode — core stats exact (row count, non-null numeric count, min, max, mean, stdev, sum). Unique counts are approximate. Median and most common values omitted in streaming mode.", file=sys.stderr)
+        print("\nNote: STREAM mode — core stats exact (row count, non-null numeric count, min, max, mean, stdev, sum). Unique counts are approximate (rounded). Median, frequency, and decimal-place heavy analysis removed for speed.", file=sys.stderr)
         sys.exit(0)
 
     size = os.stat(args.file).st_size
@@ -328,7 +290,7 @@ def main():
     # STREAM path
     headers, results = stream_stats_path(args.file)
     print_stream_results(headers, results)
-    print("\nNote: STREAM mode — core stats exact (row count, non-null numeric count, min, max, mean, stdev, sum). Unique counts may be approximate. Median and most common values omitted in streaming mode.", file=sys.stderr)
+    print("\nNote: STREAM mode — core stats exact (row count, non-null numeric count, min, max, mean, stdev, sum). Unique counts may be approximate (rounded). Median, frequency, and decimal-place heavy analysis removed for speed.", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
