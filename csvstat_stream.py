@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import csv, sys, os, math, argparse, random, subprocess, hashlib, bisect
+import csv, sys, os, math, argparse, random, subprocess, hashlib, bisect, time
 from typing import List, Tuple, Optional
 
 try:
@@ -287,6 +287,7 @@ def main():
     ap.add_argument("--force-buffer", action="store_true", help="Force BUFFER mode")
     ap.add_argument("--mem-budget", type=float, default=0.25, help="Fraction of RAM for BUFFER (default 0.25)")
     ap.add_argument("--threshold-mb", type=int, default=100, help="BUFFER if file ≤ this size (MB)")
+    ap.add_argument("--buffer-timeout-sec", type=int, default=300, help="Max seconds to allow BUFFER (csvstat) before falling back to STREAM (0 = no timeout)")
     ap.add_argument("--seed", type=int, default=1337, help="Deterministic seed for sampling/benchmarks")
     args = ap.parse_args()
 
@@ -306,12 +307,23 @@ def main():
     print(f"Mode: {mode} — file={human(size)} | reason={why} | seed={args.seed}")
 
     if mode == "BUFFER":
-        # Try delegating to real csvstat for realism
         try:
-            rc = subprocess.call(["csvstat", args.file])
-            sys.exit(rc)
-        except Exception:
-            print("(csvstat not found — falling back to STREAM path)\n", file=sys.stderr)
+            start = time.time()
+            # Use run with timeout if specified
+            if args.buffer_timeout_sec > 0:
+                try:
+                    r = subprocess.run(["csvstat", args.file], timeout=args.buffer_timeout_sec)
+                    sys.exit(r.returncode)
+                except subprocess.TimeoutExpired:
+                    elapsed = time.time() - start
+                    print(f"(BUFFER csvstat exceeded {args.buffer_timeout_sec}s (elapsed ~{int(elapsed)}s); falling back to STREAM)\n", file=sys.stderr)
+                except FileNotFoundError:
+                    print("(csvstat not found — falling back to STREAM path)\n", file=sys.stderr)
+            else:
+                r = subprocess.run(["csvstat", args.file])
+                sys.exit(r.returncode)
+        except Exception as e:
+            print(f"(BUFFER path error: {e}; falling back to STREAM)\n", file=sys.stderr)
 
     # STREAM path
     headers, results = stream_stats_path(args.file)
