@@ -1,9 +1,18 @@
+# Generated / build artifacts
 __pycache__/
-*.pyc
-*.pyo
-*.DS_Store
-.env
-.venv
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
 venv/
-tmp/
-*.txt
+
+# IDE/editor
+*.swp
+.DS_Store
+.vscode/
+
+# Local data files (generated)
+large.csv
+small.csv
+*.tmp.csv
