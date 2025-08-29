@@ -376,93 +376,6 @@ def polars_stats_path(path: str, skip_unique: bool = False):  # returns headers,
             })
     return headers, res_list
 
-def pyarrow_stats_path(path: str, skip_unique: bool = False):
-    try:
-        import pyarrow as pa  # type: ignore
-        import pyarrow.csv as pacsv  # type: ignore
-        import pyarrow.compute as pc  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"pyarrow not available: {e}")
-    table = pacsv.read_csv(path)
-    headers = table.column_names
-    res_list = []
-    for col_name in headers:
-        col = table[col_name]
-        nulls = col.null_count
-        count = len(col)
-        pa_type = col.type
-        do_unique = not skip_unique
-        if pa.types.is_integer(pa_type) or pa.types.is_floating(pa_type):
-            col_non_null = col.drop_null()
-            if len(col_non_null) > 0:
-                import math as _math
-                min_v = pc.min(col_non_null).as_py()
-                max_v = pc.max(col_non_null).as_py()
-                sum_v = pc.sum(col_non_null).as_py()
-                mean_v = pc.mean(col_non_null).as_py()
-                var_v = pc.variance(col_non_null, ddof=1).as_py() if len(col_non_null) > 1 else None
-                stdev_v = _math.sqrt(var_v) if var_v is not None else None
-            else:
-                min_v = max_v = sum_v = mean_v = stdev_v = None
-            if do_unique:
-                try:
-                    dict_encoded = pc.dictionary_encode(col_non_null)
-                    unique_v = len(dict_encoded.dictionary)
-                except Exception:
-                    unique_v = None
-            else:
-                unique_v = None
-            res_list.append({
-                "count": count,
-                "non_null_numeric": count - nulls,
-                "nulls": nulls,
-                "min": min_v,
-                "max": max_v,
-                "mean": mean_v,
-                "stdev": stdev_v,
-                "sum": sum_v,
-                "max_decimals": None,
-                "longest_len": None,
-                "is_numeric": True,
-                "unique": unique_v,
-                "unique_exact": True,
-            })
-        else:
-            if do_unique:
-                try:
-                    utf8_col = col.cast(pa.string())
-                    lengths = pc.utf8_length(utf8_col.drop_null()) if (count - nulls) > 0 else None
-                    longest = pc.max(lengths).as_py() if lengths is not None and len(lengths) > 0 else 0
-                    dict_encoded = pc.dictionary_encode(utf8_col.drop_null()) if (count - nulls) > 0 else None
-                    unique_v = len(dict_encoded.dictionary) if dict_encoded is not None else None
-                except Exception:
-                    longest = 0
-                    unique_v = None
-            else:
-                try:
-                    utf8_col = col.cast(pa.string())
-                    lengths = pc.utf8_length(utf8_col.drop_null()) if (count - nulls) > 0 else None
-                    longest = pc.max(lengths).as_py() if lengths is not None and len(lengths) > 0 else 0
-                except Exception:
-                    longest = 0
-                unique_v = None
-            res_list.append({
-                "count": count,
-                "non_null_numeric": 0,
-                "nulls": nulls,
-                "min": None,
-                "max": None,
-                "mean": None,
-                "stdev": None,
-                "sum": None,
-                "max_decimals": None,
-                "longest_len": longest,
-                "is_numeric": False,
-                "unique": unique_v,
-                "unique_exact": True,
-            })
-    return headers, res_list
-
 def print_stream_results(headers: List[str], results: List[dict], unique_skipped: bool = False):
     def pr(label: str, value: str):
         print(f"    {label.ljust(24)}{value}")
@@ -648,7 +561,7 @@ def main():
     ap.add_argument("--progress", action="store_true", help="Show streaming progress with % complete, rows/s, ETA (extra pre-pass for total rows)")
     ap.add_argument("--progress-every-rows", type=int, default=500_000, help="Emit progress every N rows when --progress is set (0=disable)")
     ap.add_argument("--seed", type=int, default=1337, help="Deterministic seed for sampling/benchmarks")
-    ap.add_argument("--engine", choices=["python","polars","pyarrow"], default="python", help="Computation engine for STREAM mode (default python)")
+    ap.add_argument("--engine", choices=["python","polars"], default="python", help="Computation engine for STREAM mode (default python)")
     ap.add_argument("--compare-csvstat", action="store_true", help="Benchmark: run streaming python engine and external csvstat; report timings, peak RSS, speedup & memory reduction")
     ap.add_argument("--skip-unique", action="store_true", help="Skip unique counting (faster, sets Unique values to '(skipped)'")
     args = ap.parse_args()
@@ -787,18 +700,14 @@ def main():
                 estimated_total_rows=est_total_rows,
                 track_unique=not args.skip_unique
             )
-    else:  # pyarrow
-        try:
-            headers, results = pyarrow_stats_path(args.file, skip_unique=args.skip_unique)
-        except Exception as e:
-            print(f"(pyarrow engine failed: {e}; falling back to python)", file=sys.stderr)
-            headers, results = stream_stats_path(
-                args.file,
-                progress_every_rows=args.progress_every_rows,
-                show_progress=args.progress,
-                estimated_total_rows=est_total_rows,
-                track_unique=not args.skip_unique
-            )
+    else:  # fallback safety
+        headers, results = stream_stats_path(
+            args.file,
+            progress_every_rows=args.progress_every_rows,
+            show_progress=args.progress,
+            estimated_total_rows=est_total_rows,
+            track_unique=not args.skip_unique
+        )
     print_stream_results(headers, results, unique_skipped=args.skip_unique)
     uniq_note = " Unique counts skipped." if args.skip_unique else " Unique counts may be approximate (rounded)."
     print(f"\nNote: STREAM mode — core stats exact (row count, numeric min/max/mean/stdev/sum).{uniq_note} Median & frequency heavy analysis removed for speed.", file=sys.stderr)
