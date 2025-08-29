@@ -63,7 +63,7 @@ To do a quick comparison now:
 ```
 gtime -v csvstat sample.csv >
 gtime -v ./csvstat_stream.py --force-stream sample.csv
-
+```
 Replace `sample.csv` with your dataset.
 
 ## 🔄 Comparison: Buffering vs. Streaming vs. Polars vs. Pandas
