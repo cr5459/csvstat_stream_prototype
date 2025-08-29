@@ -562,81 +562,8 @@ def main():
     ap.add_argument("--progress-every-rows", type=int, default=500_000, help="Emit progress every N rows when --progress is set (0=disable)")
     ap.add_argument("--seed", type=int, default=1337, help="Deterministic seed for sampling/benchmarks")
     ap.add_argument("--engine", choices=["python","polars"], default="python", help="Computation engine for STREAM mode (default python)")
-    ap.add_argument("--compare-csvstat", action="store_true", help="Benchmark: run streaming python engine and external csvstat; report timings, peak RSS, speedup & memory reduction")
     ap.add_argument("--skip-unique", action="store_true", help="Skip unique counting (faster, sets Unique values to '(skipped)'")
     args = ap.parse_args()
-
-    if args.compare_csvstat:
-        if args.file == '-':
-            print("--compare-csvstat not supported with stdin", file=sys.stderr)
-            sys.exit(2)
-        if not shutil.which('csvstat'):
-            print("csvstat not found; install csvkit to compare", file=sys.stderr)
-            sys.exit(1)
-        size = os.stat(args.file).st_size
-        print(f"Compare csvstat vs STREAM — file={human(size)} | path={args.file}")
-        runs = 3
-        stream_times: List[float] = []
-        stream_rss: List[int] = []
-        csv_times: List[float] = []
-        csv_rss: List[int] = []
-        csv_dnf = 0
-        headers_s: List[str] = []
-        results_s: List[dict] = []
-        for i in range(1, runs+1):
-            t_stream, rss_stream, h, r = measure_streaming_with_memory(args.file, skip_unique=args.skip_unique)
-            if i == 1:
-                headers_s, results_s = h, r
-            if rss_stream is not None:
-                stream_rss.append(rss_stream)
-            stream_times.append(t_stream)
-            print(f"STREAM run{i}: time={t_stream:.3f}s | peak RSS={_mb(rss_stream)}")
-            t_csvstat, rss_csvstat, dnf = measure_csvstat_time_memory(args.file, timeout=300.0)
-            if dnf:
-                csv_dnf += 1
-                print(f"csvstat run{i}: time=DNF (>300s) | peak RSS=N/A")
-            else:
-                if t_csvstat is not None:
-                    csv_times.append(t_csvstat)
-                if rss_csvstat is not None:
-                    csv_rss.append(rss_csvstat)
-                if t_csvstat is not None:
-                    print(f"csvstat run{i}: time={t_csvstat:.3f}s | peak RSS={_mb(rss_csvstat)}")
-                else:
-                    print(f"csvstat run{i}: time=N/A | peak RSS={_mb(rss_csvstat)}")
-        # Averages
-        avg_stream_time = sum(stream_times)/len(stream_times) if stream_times else None
-        avg_stream_rss = sum(stream_rss)/len(stream_rss) if stream_rss else None
-        avg_csv_time = sum(csv_times)/len(csv_times) if csv_times else None
-        avg_csv_rss = sum(csv_rss)/len(csv_rss) if csv_rss else None
-        if avg_stream_time and avg_csv_time:
-            speedup = avg_csv_time / avg_stream_time
-        else:
-            speedup = None
-        if avg_stream_rss and avg_csv_rss and avg_csv_rss > 0:
-            mem_reduction = 1.0 - (avg_stream_rss / avg_csv_rss)
-        else:
-            mem_reduction = None
-        print("--- Averages (successful runs only) ---")
-        print(f"STREAM avg time: {avg_stream_time:.3f}s | avg peak RSS: {_mb(int(avg_stream_rss) if avg_stream_rss else None)}")
-        if csv_dnf == runs:
-            print("csvstat avg time: DNF (all runs) | avg peak RSS: N/A")
-        else:
-            print(f"csvstat avg time: {avg_csv_time:.3f}s | avg peak RSS: {_mb(int(avg_csv_rss) if avg_csv_rss else None)}")
-        if speedup is not None:
-            print(f"Average speedup (csvstat/stream): {speedup:.2f}x")
-        else:
-            print("Average speedup (csvstat/stream): N/A")
-        if mem_reduction is not None:
-            print(f"Average memory reduction vs csvstat: {mem_reduction*100:.1f}%")
-        else:
-            print("Average memory reduction vs csvstat: N/A")
-        print("\nSTREAM results (abridged first run):\n")
-        print_stream_results(headers_s, results_s, unique_skipped=args.skip_unique)
-        note_extra = " All csvstat runs exceeded 300s and were terminated." if csv_dnf == runs else (" Some csvstat runs exceeded 300s and were terminated." if csv_dnf > 0 else "")
-        skip_note = " Unique counting skipped." if args.skip_unique else ""
-        print(f"\nNote: csvstat output suppressed during timing.{note_extra}{skip_note} STREAM uniques may be approximate when enabled; csvstat uniques exact.", file=sys.stderr)
-        sys.exit(0)
 
     # stdin special-case: no auto (no filesize); stream directly
     if args.file == "-":

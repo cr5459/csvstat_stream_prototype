@@ -31,7 +31,6 @@ pip install csvkit polars xxhash psutil
   --progress-every-rows INT  Progress update interval (default 500k)
   --engine python|polars
   --seed INT                 Deterministic sampling
-  --compare-csvstat          Run 3 timing/memory trials vs csvstat (buffer) and report averages
   --skip-unique              Skip unique estimation for speed
 ```
 stdin is supported with `-` (forces STREAM python engine).
@@ -60,20 +59,18 @@ python make_csv.py large_100mb.csv 1200000 6 2 0.05 1337
 ```
 
 ## Manual Benchmarking
-Automated benchmark & parity scripts were removed. To do a quick comparison now:
+Automated compare mode removed. For ad‑hoc checks you can still manually time runs:
 ```
 /usr/bin/time -v csvstat large.csv > /dev/null
 /usr/bin/time -v ./csvstat_stream.py --auto large.csv > /dev/null
-./csvstat_stream.py --compare-csvstat large.csv
 ```
-Replace `large.csv` with your dataset. `--compare-csvstat` still performs 3 streaming vs csvstat trials and reports averages (DNFs if csvstat exceeds timeout).
+Replace `large.csv` with your dataset.
 
 ## Development Notes
 - Unique estimator: KMV with k=256 (tunable). Switches from exact set to KMV after 512 unique insertions for speed.
 - Progress reporting keeps a 5s moving window for rows/s smoothing.
 - Auto mode memory model uses sampled avg row size * row count * overhead factor (3x) vs RAM budget.
 - Buffer time projection samples initial chunk to estimate full parse time; if exceeding threshold, chooses STREAM early.
-- Compare mode runs 3 trials each and reports averages; csvstat runs exceeding 300s are DNF.
 
 ## Roadmap Ideas
 - Optional median / quantiles via t-digest or reservoir sampling.
