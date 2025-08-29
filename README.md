@@ -74,14 +74,21 @@ Memory = peak resident set size (RSS). Times from GNU `time -v`.
 
 File Sizes: Small = 7.4 MB (100,000 rows), Large = 111 MB (1,500,000 rows)
 
-| File Size | Tool / Mode         | Runtime (wall) | Peak Memory | Notes |
-|-----------|---------------------|----------------|-------------|-------|
-| Small     | csvstat (BUFFER)    | 4.71 s          | 210 MB      |  |
-| Small     | csvstat (STREAM)    | 0.59 s          | 21 MB       |  |
-| Small     | Polars ()   | 0.01 s          | 125 MB       | |
-| Large   | csvstat (BUFFER)    | 96 s   | 2.38 GB     | |
-| Large    | csvstat (STREAM)    | 7.61 s       | 21 MB   |  |
-| Large    | Polars (read_csv)   | 0.29 s           | 769 MB  |  |
+## 🔄 Benchmark Comparison
+
+Benchmarks on synthetic CSVs (6 numeric + 2 string cols, 5% nulls, seed=1337).  
+Hardware: MacBook Pro M2 Pro, 32 GB RAM. Numbers = median of 3 runs.  
+Baseline = csvstat (BUFFER).
+
+| File Size | Tool / Mode       | Runtime (wall) | Peak Memory | Speedup vs Buffer | Memory Savings |
+|-----------|-------------------|----------------|-------------|-------------------|----------------|
+| Small     | csvstat (BUFFER)  | 4.71 s         | 210 MB      | 1.0× (baseline)   | –              |
+| Small     | csvstat (STREAM)  | 0.59 s         | 21 MB       | **8.0× faster**   | **~90% less**  |
+| Small     | Polars            | 0.01 s         | 125 MB      |   | ~40% less      |
+| Large     | csvstat (BUFFER)  | 96.0 s         | 2.38 GB     | 1.0× (baseline)   | –              |
+| Large     | csvstat (STREAM)  | 7.61 s         | 21 MB       | **12.6× faster**  | **~99% less**  |
+| Large     | Polars            | 0.29 s         | 769 MB      |   | ~68% less      |
+
 
 ### 🧾 Takeaways
 - **Buffering mode** in csvstat often stalls on 300 MB+ files because it loads everything into memory.  
