@@ -52,7 +52,7 @@ Falls back to python if Polars is unavailable.
 Note: Previous experimental PyArrow engine support has been removed to keep the code lean.
 
 ## Synthetic Data Generator
-`make_csv.py` streams synthetic CSVs of arbitrary size.
+`make_csv.py` makes synthetic CSVs of arbitrary size. These CSVs have a mix of nulls, numbers, and strings to mimic real world data.
 ```
 python make_csv.py output.csv ROWS NUM_COLS STR_COLS NULL_RATE SEED
 # Example (~100MB target try):
@@ -60,10 +60,10 @@ python make_csv.py large_100mb.csv 1200000 6 2 0.05 1337
 ```
 
 ## Manual Benchmarking
-Automated benchmark & parity scripts were removed. To do a quick comparison now:
+To do a quick comparison now:
 ```
-/usr/bin/time -v csvstat large.csv > /dev/null
-/usr/bin/time -v ./csvstat_stream.py --auto large.csv > /dev/null
+gtime -v csvstat large.csv > /dev/null
+gtime -v ./csvstat_stream.py --auto large.csv > /dev/null
 ./csvstat_stream.py --compare-csvstat large.csv
 ```
 Replace `large.csv` with your dataset. `--compare-csvstat` still performs 3 streaming vs csvstat trials and reports averages (DNFs if csvstat exceeds timeout).
@@ -74,12 +74,6 @@ Replace `large.csv` with your dataset. `--compare-csvstat` still performs 3 stre
 - Auto mode memory model uses sampled avg row size * row count * overhead factor (3x) vs RAM budget.
 - Buffer time projection samples initial chunk to estimate full parse time; if exceeding threshold, chooses STREAM early.
 - Compare mode runs 3 trials each and reports averages; csvstat runs exceeding 300s are DNF.
-
-## Roadmap Ideas
-- Optional median / quantiles via t-digest or reservoir sampling.
-- Frequency sketch (Heavy Hitters) for top values.
-- Threaded IO prefetch for Python engine.
-- Adaptive KMV size based on memory.
 
 ## License
 Prototype code for evaluation.
