@@ -41,7 +41,7 @@ stdin is supported with `-` (forces STREAM python engine).
 ```
 
 ## Accuracy Contract (STREAM)
-Core numeric stats are exact. Unique counts are approximate when cardinality exceeds 2k * sketch_k (KMV), rounded for readability. Omitted heavier stats (median, top frequencies) for constant memory and speed. Text length max is exact.
+Core numeric stats are exact. Unique counts approximate, rounded for readability. Omitted heavier stats (median, top frequencies) for constant memory and speed. Text length max is exact.
 
 ## Engines
 - python: one-pass csv.reader loop with light Python data structures.
@@ -74,7 +74,9 @@ Memory = peak resident set size (RSS). Times from GNU `time -v`.
 
 File Sizes: Small = 7.4 MB (100,000 rows), Large = 111 MB (1,500,000 rows)
 
-## 🔄 Benchmark Comparison
+Would have gone larger, but the 300MB did not complete after 5+ minutes and the 700MB didn't complete even after 45+ minutes (aborted).
+
+## Benchmark Comparison
 
 Benchmarks on synthetic CSVs (6 numeric + 2 string cols, 5% nulls, seed=1337).  
 Hardware: MacBook Pro M2 Pro, 32 GB RAM. Numbers = median of 3 runs.  
