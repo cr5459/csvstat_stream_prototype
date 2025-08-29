@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import csv, sys, os, math, argparse, random, subprocess, hashlib, bisect, time, re
+import csv, sys, os, math, argparse, random, subprocess, hashlib, bisect, time, re, shutil, threading
 from typing import List, Tuple, Optional
 from collections import deque  # progress window
 
@@ -17,8 +17,6 @@ try:
 except Exception:  # fallback
     def _fast_hash64(val: str) -> int:
         return int.from_bytes(hashlib.blake2b(val.encode('utf-8','ignore'), digest_size=8).digest(), 'big')
-
-_NUM_RE = re.compile(r'^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+-]?\d+)?$')
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -79,8 +77,8 @@ class KMVEstimator:
 
 # ---- Running numeric/text stats ----
 class RunningStats:
-    __slots__ = ("n","nn","nulls","mean","M2","min","max","sum","max_decimals","longest_len","is_numeric","unique")
-    def __init__(self):
+    __slots__ = ("n","nn","nulls","mean","M2","min","max","sum","max_decimals","longest_len","is_numeric","unique","track_unique")
+    def __init__(self, track_unique: bool = True):
         self.n = 0
         self.nn = 0
         self.nulls = 0
@@ -92,18 +90,19 @@ class RunningStats:
         self.max_decimals = 0
         self.longest_len = 0
         self.is_numeric = True
-        self.unique = KMVEstimator(k=256)
+        self.track_unique = track_unique
+        self.unique = KMVEstimator(k=256) if track_unique else None
     def add_cell(self, cell: str):
         self.n += 1
         if cell == "":
             self.nulls += 1
-            self.unique.add("None")
+            if self.track_unique and self.unique is not None:
+                self.unique.add("None")
             return
-        # Fast numeric path (avoid exceptions):
-        if self.is_numeric and _NUM_RE.match(cell):
+        if self.is_numeric:
             try:
                 x = float(cell)
-            except ValueError:  # extremely rare given regex
+            except ValueError:
                 self.is_numeric = False
             else:
                 self.nn += 1
@@ -117,17 +116,21 @@ class RunningStats:
                     decs = len(cell.rsplit(".",1)[1].rstrip("0"))
                     if decs > self.max_decimals:
                         self.max_decimals = decs
-                self.unique.add(cell)
+                if self.track_unique and self.unique is not None:
+                    self.unique.add(cell)
                 return
-        # Text / mixed fallback
         self.is_numeric = False
         l = len(cell)
         if l > self.longest_len:
             self.longest_len = l
-        self.unique.add(cell)
+        if self.track_unique and self.unique is not None:
+            self.unique.add(cell)
     def result(self) -> dict:
         stdev = math.sqrt(self.M2 / (self.nn - 1)) if self.nn > 1 else None
-        uniq_est, uniq_exact = self.unique.estimate()
+        if not self.track_unique or self.unique is None:
+            uniq_est, uniq_exact = (None, True)
+        else:
+            uniq_est, uniq_exact = self.unique.estimate()
         return {
             "count": self.n,
             "non_null_numeric": self.nn,
@@ -158,6 +161,17 @@ def sample_avg_row_bytes(path: str, n: int = 50_000, seed: int = 1337) -> Tuple[
     if rows == 0:
         return (0.0, 0)
     return (total / rows, rows)
+
+def count_total_data_rows(path: str, chunk_size: int = 8 * 1024 * 1024) -> int:
+    """Exact newline count (minus header) for ETA when --eta is enabled."""
+    total_newlines = 0
+    with open(path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            total_newlines += chunk.count(b'\n')
+    return max(0, total_newlines - 1)
 
 # --- Adaptive time projection for BUFFER ---
 def project_buffer_time(path: str, max_seconds: float = 1.5, max_rows: int = 200_000) -> Optional[float]:
@@ -215,10 +229,10 @@ def choose_mode(path: str, auto: bool, force_stream: bool, force_buffer: bool,
         return ("BUFFER", mem_reason)
     return ("STREAM", f"est_mem {human(est_mem)} > budget {human(budget)}")
 
-def stream_stats_filelike(fh, *, progress_every_rows: int = 0, show_progress: bool = False, total_size: Optional[int] = None, estimated_total_rows: Optional[float] = None):
+def stream_stats_filelike(fh, *, progress_every_rows: int = 0, show_progress: bool = False, total_size: Optional[int] = None, estimated_total_rows: Optional[float] = None, track_unique: bool = True):
     rdr = csv.reader(fh)
     headers = next(rdr)
-    stats = [RunningStats() for _ in headers]
+    stats = [RunningStats(track_unique=track_unique) for _ in headers]
     rows = 0
     start = time.time()
     window = deque()  # (time, rows)
@@ -264,18 +278,192 @@ def stream_stats_filelike(fh, *, progress_every_rows: int = 0, show_progress: bo
         report()
     return headers, [s.result() for s in stats]
 
-def stream_stats_path(path: str, *, progress_every_rows: int = 0, show_progress: bool = False, estimated_total_rows: Optional[float] = None) -> Tuple[List[str], List[dict]]:
+def stream_stats_path(path: str, *, progress_every_rows: int = 0, show_progress: bool = False, estimated_total_rows: Optional[float] = None, track_unique: bool = True) -> Tuple[List[str], List[dict]]:
     total_size = os.stat(path).st_size if show_progress else None
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8", buffering=1024*1024) as f:  # larger buffer
         return stream_stats_filelike(
             f,
             progress_every_rows=progress_every_rows,
             show_progress=show_progress,
             total_size=total_size,
-            estimated_total_rows=estimated_total_rows
+            estimated_total_rows=estimated_total_rows,
+            track_unique=track_unique
         )
 
-def print_stream_results(headers: List[str], results: List[dict]):
+# ---- Polars / PyArrow engines ----
+def _is_polars_numeric(dtype) -> bool:  # resilient numeric dtype checker
+    try:
+        import polars as pl  # type: ignore
+        from polars.datatypes import INTEGER_DTYPES, FLOAT_DTYPES  # type: ignore
+        return (dtype in INTEGER_DTYPES) or (dtype in FLOAT_DTYPES)
+    except Exception:
+        s = str(dtype).lower()
+        return any(x in s for x in ("int", "float", "decimal"))
+
+def polars_stats_path(path: str, skip_unique: bool = False):  # returns headers, results
+    try:
+        import polars as pl  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"polars not available: {e}")
+    lf = pl.scan_csv(path)
+    try:
+        schema = lf.collect_schema()
+    except Exception:
+        schema = lf.schema
+    # Revert to per-column non-null counts (c.count()), not total row length
+    exprs = []
+    for col, dtype in schema.items():
+        c = pl.col(col)
+        exprs.append(c.count().alias(f"{col}__count"))          # non-null count only
+        exprs.append(c.null_count().alias(f"{col}__nulls"))     # null count
+        if not skip_unique:
+            exprs.append(c.n_unique().alias(f"{col}__unique"))  # distinct non-null values
+        if _is_polars_numeric(dtype):
+            exprs.extend([
+                c.min().alias(f"{col}__min"),
+                c.max().alias(f"{col}__max"),
+                c.mean().alias(f"{col}__mean"),
+                c.std().alias(f"{col}__stdev"),
+                c.sum().alias(f"{col}__sum"),
+            ])
+        else:
+            exprs.append(c.cast(pl.Utf8).str.len_chars().max().alias(f"{col}__longest"))
+    try:
+        out = lf.select(exprs).collect(engine="streaming")
+    except TypeError:
+        out = lf.select(exprs).collect(streaming=True)
+    headers = list(schema.keys())
+    res_list = []
+    cols_set = set(out.columns)
+    for col, dtype in schema.items():
+        # count is non-null count (legacy / potentially inaccurate vs total rows with nulls)
+        count = int(out[f"{col}__count"][0]) if f"{col}__count" in cols_set else 0
+        nulls = int(out[f"{col}__nulls"][0]) if f"{col}__nulls" in cols_set else 0
+        unique = int(out[f"{col}__unique"][0]) if (not skip_unique and f"{col}__unique" in cols_set) else None
+        if _is_polars_numeric(dtype) and f"{col}__min" in cols_set:
+            res_list.append({
+                "count": count,                      # non-null count only
+                "non_null_numeric": count,           # since count excludes nulls
+                "nulls": nulls,
+                "min": out[f"{col}__min"][0],
+                "max": out[f"{col}__max"][0],
+                "mean": out[f"{col}__mean"][0],
+                "stdev": out[f"{col}__stdev"][0],
+                "sum": out[f"{col}__sum"][0],
+                "max_decimals": None,
+                "longest_len": None,
+                "is_numeric": True,
+                "unique": unique,
+                "unique_exact": True,
+            })
+        else:
+            longest_col = f"{col}__longest"
+            longest_val = int(out[longest_col][0]) if longest_col in cols_set and out[longest_col][0] is not None else 0
+            res_list.append({
+                "count": count,
+                "non_null_numeric": 0,
+                "nulls": nulls,
+                "min": None,
+                "max": None,
+                "mean": None,
+                "stdev": None,
+                "sum": None,
+                "max_decimals": None,
+                "longest_len": longest_val,
+                "is_numeric": False,
+                "unique": unique,
+                "unique_exact": True,
+            })
+    return headers, res_list
+
+def pyarrow_stats_path(path: str, skip_unique: bool = False):
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.csv as pacsv  # type: ignore
+        import pyarrow.compute as pc  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"pyarrow not available: {e}")
+    table = pacsv.read_csv(path)
+    headers = table.column_names
+    res_list = []
+    for col_name in headers:
+        col = table[col_name]
+        nulls = col.null_count
+        count = len(col)
+        pa_type = col.type
+        do_unique = not skip_unique
+        if pa.types.is_integer(pa_type) or pa.types.is_floating(pa_type):
+            col_non_null = col.drop_null()
+            if len(col_non_null) > 0:
+                import math as _math
+                min_v = pc.min(col_non_null).as_py()
+                max_v = pc.max(col_non_null).as_py()
+                sum_v = pc.sum(col_non_null).as_py()
+                mean_v = pc.mean(col_non_null).as_py()
+                var_v = pc.variance(col_non_null, ddof=1).as_py() if len(col_non_null) > 1 else None
+                stdev_v = _math.sqrt(var_v) if var_v is not None else None
+            else:
+                min_v = max_v = sum_v = mean_v = stdev_v = None
+            if do_unique:
+                try:
+                    dict_encoded = pc.dictionary_encode(col_non_null)
+                    unique_v = len(dict_encoded.dictionary)
+                except Exception:
+                    unique_v = None
+            else:
+                unique_v = None
+            res_list.append({
+                "count": count,
+                "non_null_numeric": count - nulls,
+                "nulls": nulls,
+                "min": min_v,
+                "max": max_v,
+                "mean": mean_v,
+                "stdev": stdev_v,
+                "sum": sum_v,
+                "max_decimals": None,
+                "longest_len": None,
+                "is_numeric": True,
+                "unique": unique_v,
+                "unique_exact": True,
+            })
+        else:
+            if do_unique:
+                try:
+                    utf8_col = col.cast(pa.string())
+                    lengths = pc.utf8_length(utf8_col.drop_null()) if (count - nulls) > 0 else None
+                    longest = pc.max(lengths).as_py() if lengths is not None and len(lengths) > 0 else 0
+                    dict_encoded = pc.dictionary_encode(utf8_col.drop_null()) if (count - nulls) > 0 else None
+                    unique_v = len(dict_encoded.dictionary) if dict_encoded is not None else None
+                except Exception:
+                    longest = 0
+                    unique_v = None
+            else:
+                try:
+                    utf8_col = col.cast(pa.string())
+                    lengths = pc.utf8_length(utf8_col.drop_null()) if (count - nulls) > 0 else None
+                    longest = pc.max(lengths).as_py() if lengths is not None and len(lengths) > 0 else 0
+                except Exception:
+                    longest = 0
+                unique_v = None
+            res_list.append({
+                "count": count,
+                "non_null_numeric": 0,
+                "nulls": nulls,
+                "min": None,
+                "max": None,
+                "mean": None,
+                "stdev": None,
+                "sum": None,
+                "max_decimals": None,
+                "longest_len": longest,
+                "is_numeric": False,
+                "unique": unique_v,
+                "unique_exact": True,
+            })
+    return headers, res_list
+
+def print_stream_results(headers: List[str], results: List[dict], unique_skipped: bool = False):
     def pr(label: str, value: str):
         print(f"    {label.ljust(24)}{value}")
     def fmt_num(x: Optional[float]):
@@ -287,7 +475,7 @@ def print_stream_results(headers: List[str], results: List[dict]):
         return f"{x:,.3f}"
     def fmt_unique(u: Optional[int]):
         if u is None:
-            return "None"
+            return "(skipped)" if unique_skipped else "None"
         return f"{int(round(u/1000.0))*1000:,}"  # round to nearest 1000
     total_rows = results[0]['count'] if results else 0
     for idx, (h, r) in enumerate(zip(headers, results), start=1):
@@ -304,9 +492,8 @@ def print_stream_results(headers: List[str], results: List[dict]):
                 pr("Largest value:", fmt_num(r['max']))
             if r['sum'] is not None:
                 pr("Sum:", fmt_num(r['sum']))
-            mean = r['mean']; stdev = r['stdev']
-            pr("Mean:", fmt_num(mean))
-            pr("StDev:", fmt_num(stdev))
+            pr("Mean:", fmt_num(r['mean']))
+            pr("StDev:", fmt_num(r['stdev']))
             if r['max_decimals'] is not None:
                 pr("Most decimal places:", str(r['max_decimals']))
         else:
@@ -319,6 +506,134 @@ def print_stream_results(headers: List[str], results: List[dict]):
         print()
     print(f"Row count: {total_rows:,}")
 
+# Memory/time helper functions (define unconditionally once)
+# (Placed early so linter sees them before use.)
+
+def _mb(n_bytes: Optional[int]) -> str:
+    if not n_bytes:
+        return "N/A"
+    return f"{n_bytes/1024/1024:.1f} MB"
+
+def measure_streaming_with_memory(path: str, skip_unique: bool = False) -> Tuple[float, Optional[int], List[str], List[dict]]:
+    peak_rss = 0
+    stop_flag = False
+    if psutil:
+        proc = psutil.Process(os.getpid())
+        def sampler():
+            nonlocal peak_rss, stop_flag
+            while not stop_flag:
+                try:
+                    rss = proc.memory_info().rss
+                    if rss > peak_rss:
+                        peak_rss = rss
+                except Exception:
+                    pass
+                time.sleep(0.05)
+        th = threading.Thread(target=sampler, daemon=True)
+        th.start()
+    t0 = time.time()
+    headers, results = stream_stats_path(path, progress_every_rows=0, show_progress=False, estimated_total_rows=None, track_unique=not skip_unique)
+    elapsed = time.time() - t0
+    stop_flag = True
+    if psutil:
+        th.join(timeout=0.2)
+        try:
+            rss = psutil.Process(os.getpid()).memory_info().rss
+            if rss > peak_rss:
+                peak_rss = rss
+        except Exception:
+            pass
+    return elapsed, (peak_rss if peak_rss else None), headers, results
+
+def measure_csvstat_time_memory(path: str, timeout: float = 300.0) -> Tuple[Optional[float], Optional[int], bool]:
+    """Run external csvstat capturing elapsed time and peak RSS.
+    Returns (elapsed_seconds_or_None, peak_rss_bytes_or_None, dnf_flag).
+    dnf_flag is True if the run exceeded timeout and was terminated.
+    """
+    time_tool = '/usr/bin/time' if os.path.exists('/usr/bin/time') else None
+    # Try BSD -l then GNU -v variants
+    for flags, pattern, scale in ((['-l'], 'maximum resident set size', 1), (['-v'], 'Maximum resident set size', 1024)):
+        if not time_tool:
+            break
+        cmd = [time_tool] + flags + ['csvstat', path]
+        try:
+            start = time.time()
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            stderr_data = []
+            while True:
+                ret = proc.poll()
+                if ret is not None:
+                    break
+                if (time.time() - start) > timeout:
+                    # timeout -> kill
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        _, _ = proc.communicate(timeout=1)
+                    except Exception:
+                        pass
+                    return (None, None, True)
+                time.sleep(0.05)
+            _, err = proc.communicate()
+            if ret == 0 and err:
+                for line in err.splitlines():
+                    if pattern in line:
+                        nums = re.findall(r'(\d+)', line)
+                        if nums:
+                            rss = int(nums[0]) * scale
+                            elapsed = time.time() - start
+                            return (elapsed, rss, False)
+        except Exception:
+            continue
+    # Fallback psutil-based measurement
+    if psutil:
+        try:
+            start = time.time()
+            p = subprocess.Popen(['csvstat', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ps_p = psutil.Process(p.pid)
+            peak = 0
+            while True:
+                ret = p.poll()
+                try:
+                    rss = ps_p.memory_info().rss
+                    if rss > peak:
+                        peak = rss
+                except Exception:
+                    pass
+                if ret is not None:
+                    break
+                if (time.time() - start) > timeout:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    return (None, None, True)
+                time.sleep(0.05)
+            elapsed = time.time() - start
+            return (elapsed, peak if peak else None, False)
+        except Exception:
+            pass
+    # Last resort: just time it (still respect timeout)
+    start = time.time()
+    try:
+        p2 = subprocess.Popen(['csvstat', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        while True:
+            ret = p2.poll()
+            if ret is not None:
+                break
+            if (time.time() - start) > timeout:
+                try:
+                    p2.kill()
+                except Exception:
+                    pass
+                return (None, None, True)
+            time.sleep(0.05)
+    except Exception:
+        pass
+    return (time.time() - start, None, False)
+
 def main():
     ap = argparse.ArgumentParser(description="Streaming csvstat prototype with Auto mode")
     ap.add_argument("file", help="CSV path or '-' for stdin")
@@ -330,18 +645,94 @@ def main():
     ap.add_argument("--hard-cap-mb", type=int, default=300, help="> this size forces STREAM regardless of other heuristics (MB)")
     ap.add_argument("--target-buffer-seconds", type=float, default=60.0, help="If projected BUFFER time exceeds this, use STREAM")
     ap.add_argument("--buffer-timeout-sec", type=int, default=300, help="Max seconds to allow BUFFER (csvstat) before falling back to STREAM (0 = no timeout)")
-    ap.add_argument("--progress-every-rows", type=int, default=500_000, help="Emit streaming progress every N rows (STREAM mode only; 0=disable)")
-    ap.add_argument("--no-progress", action="store_true", help="Disable progress/ETA output in STREAM mode")
-    ap.add_argument("--expected-rows", type=float, default=None, help="Known total data rows (excludes header). If provided, used for exact progress % & ETA.")
+    ap.add_argument("--progress", action="store_true", help="Show streaming progress with % complete, rows/s, ETA (extra pre-pass for total rows)")
+    ap.add_argument("--progress-every-rows", type=int, default=500_000, help="Emit progress every N rows when --progress is set (0=disable)")
     ap.add_argument("--seed", type=int, default=1337, help="Deterministic seed for sampling/benchmarks")
+    ap.add_argument("--engine", choices=["python","polars","pyarrow"], default="python", help="Computation engine for STREAM mode (default python)")
+    ap.add_argument("--compare-csvstat", action="store_true", help="Benchmark: run streaming python engine and external csvstat; report timings, peak RSS, speedup & memory reduction")
+    ap.add_argument("--skip-unique", action="store_true", help="Skip unique counting (faster, sets Unique values to '(skipped)'")
     args = ap.parse_args()
+
+    if args.compare_csvstat:
+        if args.file == '-':
+            print("--compare-csvstat not supported with stdin", file=sys.stderr)
+            sys.exit(2)
+        if not shutil.which('csvstat'):
+            print("csvstat not found; install csvkit to compare", file=sys.stderr)
+            sys.exit(1)
+        size = os.stat(args.file).st_size
+        print(f"Compare csvstat vs STREAM — file={human(size)} | path={args.file}")
+        runs = 3
+        stream_times: List[float] = []
+        stream_rss: List[int] = []
+        csv_times: List[float] = []
+        csv_rss: List[int] = []
+        csv_dnf = 0
+        headers_s: List[str] = []
+        results_s: List[dict] = []
+        for i in range(1, runs+1):
+            t_stream, rss_stream, h, r = measure_streaming_with_memory(args.file, skip_unique=args.skip_unique)
+            if i == 1:
+                headers_s, results_s = h, r
+            if rss_stream is not None:
+                stream_rss.append(rss_stream)
+            stream_times.append(t_stream)
+            print(f"STREAM run{i}: time={t_stream:.3f}s | peak RSS={_mb(rss_stream)}")
+            t_csvstat, rss_csvstat, dnf = measure_csvstat_time_memory(args.file, timeout=300.0)
+            if dnf:
+                csv_dnf += 1
+                print(f"csvstat run{i}: time=DNF (>300s) | peak RSS=N/A")
+            else:
+                if t_csvstat is not None:
+                    csv_times.append(t_csvstat)
+                if rss_csvstat is not None:
+                    csv_rss.append(rss_csvstat)
+                if t_csvstat is not None:
+                    print(f"csvstat run{i}: time={t_csvstat:.3f}s | peak RSS={_mb(rss_csvstat)}")
+                else:
+                    print(f"csvstat run{i}: time=N/A | peak RSS={_mb(rss_csvstat)}")
+        # Averages
+        avg_stream_time = sum(stream_times)/len(stream_times) if stream_times else None
+        avg_stream_rss = sum(stream_rss)/len(stream_rss) if stream_rss else None
+        avg_csv_time = sum(csv_times)/len(csv_times) if csv_times else None
+        avg_csv_rss = sum(csv_rss)/len(csv_rss) if csv_rss else None
+        if avg_stream_time and avg_csv_time:
+            speedup = avg_csv_time / avg_stream_time
+        else:
+            speedup = None
+        if avg_stream_rss and avg_csv_rss and avg_csv_rss > 0:
+            mem_reduction = 1.0 - (avg_stream_rss / avg_csv_rss)
+        else:
+            mem_reduction = None
+        print("--- Averages (successful runs only) ---")
+        print(f"STREAM avg time: {avg_stream_time:.3f}s | avg peak RSS: {_mb(int(avg_stream_rss) if avg_stream_rss else None)}")
+        if csv_dnf == runs:
+            print("csvstat avg time: DNF (all runs) | avg peak RSS: N/A")
+        else:
+            print(f"csvstat avg time: {avg_csv_time:.3f}s | avg peak RSS: {_mb(int(avg_csv_rss) if avg_csv_rss else None)}")
+        if speedup is not None:
+            print(f"Average speedup (csvstat/stream): {speedup:.2f}x")
+        else:
+            print("Average speedup (csvstat/stream): N/A")
+        if mem_reduction is not None:
+            print(f"Average memory reduction vs csvstat: {mem_reduction*100:.1f}%")
+        else:
+            print("Average memory reduction vs csvstat: N/A")
+        print("\nSTREAM results (abridged first run):\n")
+        print_stream_results(headers_s, results_s, unique_skipped=args.skip_unique)
+        note_extra = " All csvstat runs exceeded 300s and were terminated." if csv_dnf == runs else (" Some csvstat runs exceeded 300s and were terminated." if csv_dnf > 0 else "")
+        skip_note = " Unique counting skipped." if args.skip_unique else ""
+        print(f"\nNote: csvstat output suppressed during timing.{note_extra}{skip_note} STREAM uniques may be approximate when enabled; csvstat uniques exact.", file=sys.stderr)
+        sys.exit(0)
 
     # stdin special-case: no auto (no filesize); stream directly
     if args.file == "-":
         print(f"Mode: STREAM — stdin | reason=no size available | seed={args.seed}")
-        headers, results = stream_stats_filelike(sys.stdin, progress_every_rows=args.progress_every_rows, show_progress=not args.no_progress, total_size=None)
-        print_stream_results(headers, results)
-        print("\nNote: STREAM mode — core stats exact (row count, non-null numeric count, min, max, mean, stdev, sum). Unique counts are approximate (rounded). Median, frequency, and decimal-place heavy analysis removed for speed.", file=sys.stderr)
+        if args.engine != "python":
+            print("(Non-python engines not supported for stdin; using python engine)", file=sys.stderr)
+        headers, results = stream_stats_filelike(sys.stdin, progress_every_rows=args.progress_every_rows, show_progress=args.progress, total_size=None, track_unique=not args.skip_unique)
+        print_stream_results(headers, results, unique_skipped=args.skip_unique)
+        print("\nNote: STREAM mode — core stats exact. Unique counts are approximate when enabled; median & frequencies omitted.", file=sys.stderr)
         sys.exit(0)
 
     size = os.stat(args.file).st_size
@@ -373,23 +764,44 @@ def main():
 
     # STREAM path
     est_total_rows = None
-    if not args.no_progress and args.progress_every_rows > 0:
-        if args.expected_rows and args.expected_rows > 0:
-            est_total_rows = float(args.expected_rows)
-        else:
-            # reuse sampling to estimate total rows for percent + ETA
-            avg_row, _ = sample_avg_row_bytes(args.file, n=50_000, seed=args.seed)
-            if avg_row > 0:
-                # subtract header size impact by ignoring first line in avg (already done in sample as first line included) – acceptable approximation
-                est_total_rows = size / avg_row
-    headers, results = stream_stats_path(
-        args.file,
-        progress_every_rows=args.progress_every_rows,
-        show_progress=not args.no_progress,
-        estimated_total_rows=est_total_rows
-    )
-    print_stream_results(headers, results)
-    print("\nNote: STREAM mode — core stats exact (row count, non-null numeric count, min, max, mean, stdev, sum). Unique counts may be approximate (rounded). Median, frequency, and decimal-place heavy analysis removed for speed.", file=sys.stderr)
+    if args.progress and args.progress_every_rows > 0:
+        # exact count pass for percent + ETA
+        est_total_rows = count_total_data_rows(args.file)
+    if args.engine == "python":
+        headers, results = stream_stats_path(
+            args.file,
+            progress_every_rows=args.progress_every_rows,
+            show_progress=args.progress,
+            estimated_total_rows=est_total_rows,
+            track_unique=not args.skip_unique
+        )
+    elif args.engine == "polars":
+        try:
+            headers, results = polars_stats_path(args.file, skip_unique=args.skip_unique)
+        except Exception as e:
+            print(f"(polars engine failed: {e}; falling back to python)", file=sys.stderr)
+            headers, results = stream_stats_path(
+                args.file,
+                progress_every_rows=args.progress_every_rows,
+                show_progress=args.progress,
+                estimated_total_rows=est_total_rows,
+                track_unique=not args.skip_unique
+            )
+    else:  # pyarrow
+        try:
+            headers, results = pyarrow_stats_path(args.file, skip_unique=args.skip_unique)
+        except Exception as e:
+            print(f"(pyarrow engine failed: {e}; falling back to python)", file=sys.stderr)
+            headers, results = stream_stats_path(
+                args.file,
+                progress_every_rows=args.progress_every_rows,
+                show_progress=args.progress,
+                estimated_total_rows=est_total_rows,
+                track_unique=not args.skip_unique
+            )
+    print_stream_results(headers, results, unique_skipped=args.skip_unique)
+    uniq_note = " Unique counts skipped." if args.skip_unique else " Unique counts may be approximate (rounded)."
+    print(f"\nNote: STREAM mode — core stats exact (row count, numeric min/max/mean/stdev/sum).{uniq_note} Median & frequency heavy analysis removed for speed.", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

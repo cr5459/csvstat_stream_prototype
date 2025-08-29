@@ -15,4 +15,6 @@ venv/
 # Local data files (generated)
 large.csv
 small.csv
+100.csv
+300.csv
 *.tmp.csv
