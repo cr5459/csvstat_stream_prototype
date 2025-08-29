@@ -1,6 +1,6 @@
 # csvstat_stream_prototype
 
-Streaming / auto-mode prototype inspired by csvkit's `csvstat` for large CSV profiling with constant memory.
+Streaming prototype inspired by csvkit's `csvstat` for large CSV profiling with constant memory.
 
 ## Features
 - Auto mode chooses BUFFER (delegates to `csvstat`) or STREAM (one-pass) using file size, RAM budget, projected in-memory cost, and projected buffer time.
@@ -69,31 +69,30 @@ Replace `sample.csv` with your dataset.
 ## 🔄 Comparison: Buffering vs. Streaming vs. Polars vs. Pandas
 
 Benchmarks on synthetic CSVs (6 numeric + 2 string columns, 5% nulls, seed=1337).  
-Hardware: MacBook Pro M2 Pro, 32 GB RAM. Numbers are median of 3 runs.  
+Hardware: MacBook Pro M2 Pro, 16 GB RAM. Numbers are median of 3 runs.  
 Memory = peak resident set size (RSS). Times from GNU `time -v`.
+
+File Sizes: Small = 7.4 MB (100,000 rows), Large = 111 MB (1,500,000 rows)
 
 | File Size | Tool / Mode         | Runtime (wall) | Peak Memory | Notes |
 |-----------|---------------------|----------------|-------------|-------|
-| 10 MB     | csvstat (BUFFER)    | 1.2 s          | 120 MB      | Full accuracy |
-| 10 MB     | csvstat (STREAM)    | 1.1 s          | 24 MB       | Core stats exact |
-| 10 MB     | Polars (read_csv)   | 0.6 s          | 60 MB       | Loads fully into Arrow table |
-| 1.0 GB    | csvstat (BUFFER)    | 210 s (hung)   | 3.5 GB+     | Often stalls / crashes |
-| 1.0 GB    | csvstat (STREAM)    | **60 s**       | **24 MB**   | Exact core stats; stable |
-| 1.0 GB    | Pandas (read_csv)   | 75 s           | 8–10 GB     | Requires full memory |
-| 1.0 GB    | Polars (read_csv)   | 45 s           | 1.5–2.0 GB  | Faster, but memory scales |
+| Small     | csvstat (BUFFER)    | 4.71 s          | 210 MB      |  |
+| Small     | csvstat (STREAM)    | 0.59 s          | 21 MB       |  |
+| Small     | Polars ()   | 0.01 s          | 125 MB       | |
+| Large   | csvstat (BUFFER)    | 96 s   | 2.38 GB     | |
+| Large    | csvstat (STREAM)    | 7.61 s       | 21 MB   |  |
+| Large    | Polars (read_csv)   | 0.29 s           | 769 MB  |  |
 
 ### 🧾 Takeaways
 - **Buffering mode** in csvstat often stalls on 300 MB+ files because it loads everything into memory.  
-- **Streaming prototype** runs in **constant ~24 MB memory** regardless of file size; exact core stats in one pass.  
 - **Polars** is much faster for analytics, but memory grows linearly with dataset size.  
-- **Best of both worlds:** Auto mode → small files use buffer (full metrics), large files use stream (fast + reliable).
 
 ## Development Notes
-- Unique estimator: KMV with k=256 (tunable). Switches from exact set to KMV after 512 unique insertions for speed.
-- Progress reporting keeps a 5s moving window for rows/s smoothing.
-- Auto mode memory model uses sampled avg row size * row count * overhead factor (3x) vs RAM budget.
-- Buffer time projection samples initial chunk to estimate full parse time; if exceeding threshold, chooses STREAM early.
-- Compare mode runs 3 trials each and reports averages; csvstat runs exceeding 300s are DNF.
+- Counts uniques exactly when small, then uses a quick sampling shortcut (KMV) after 512 items.  
+- Shows speed as a smooth average over the last 5 seconds.  
+- Guesses memory use by sampling row size and multiplying by row count with extra padding.  
+- Tries a small sample to guess total time; if too slow, switches to streaming mode early.  
+- Runs each test 3 times, takes the average, and marks anything over 300s as DNF (did not finish).  
 
 ## License
 Prototype code for evaluation.
