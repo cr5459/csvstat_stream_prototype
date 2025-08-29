@@ -32,6 +32,7 @@ pip install csvkit polars xxhash psutil
   --engine python|polars
   --seed INT                 Deterministic sampling
   --compare-csvstat          Run 3 timing/memory trials vs csvstat (buffer) and report averages
+  --skip-unique              Skip unique estimation for speed
 ```
 stdin is supported with `-` (forces STREAM python engine).
 
@@ -58,50 +59,21 @@ python make_csv.py output.csv ROWS NUM_COLS STR_COLS NULL_RATE SEED
 python make_csv.py large_100mb.csv 1200000 6 2 0.05 1337
 ```
 
-## Benchmark Harness
-`bench.sh` runs repeated timings across modes and engines.
+## Manual Benchmarking
+Automated benchmark & parity scripts were removed. To do a quick comparison now:
 ```
-./bench.sh large.csv --engines python,polars --modes auto,stream --reps 5
+/usr/bin/time -v csvstat large.csv > /dev/null
+/usr/bin/time -v ./csvstat_stream.py --auto large.csv > /dev/null
+./csvstat_stream.py --compare-csvstat large.csv
 ```
-Outputs a TSV in `bench_runs/` with timing and derived rows/s.
-
-Summarize:
-```
-./summarize_times.py bench_runs/bench_*.tsv
-```
-
-Quick ad‑hoc comparison (3 trials, averages + DNFs):
-```
-./csvstat_stream.py large.csv --compare-csvstat
-```
-
-## Benchmark results (median of 3 runs)
-(Fill in with your measurements; SMALL = e.g. < threshold (BUFFER expected), LARGE = triggers STREAM.)
-
-| Case         | Wall time (s) | Peak Memory (MB) |
-|--------------|---------------|------------------|
-| Small BASE   |               |                  |
-| Small STREAM |               |                  |
-| Large BASE   |               |                  |
-| Large STREAM |               |                  |
-
-Notes:
-- BASE = csvkit csvstat (BUFFER) run
-- STREAM = this prototype
-- Use `--compare-csvstat` for automated averages; for medians run multiple times manually and compute median.
-
-## Parity Test
-`tests_small_parity.py` creates a small CSV and checks basic numeric parity vs csvstat (if available).
-```
-python3 tests_small_parity.py
-```
+Replace `large.csv` with your dataset. `--compare-csvstat` still performs 3 streaming vs csvstat trials and reports averages (DNFs if csvstat exceeds timeout).
 
 ## Development Notes
 - Unique estimator: KMV with k=256 (tunable). Switches from exact set to KMV after 512 unique insertions for speed.
 - Progress reporting keeps a 5s moving window for rows/s smoothing.
 - Auto mode memory model uses sampled avg row size * row count * overhead factor (3x) vs RAM budget.
 - Buffer time projection samples initial chunk to estimate full parse time; if exceeding threshold, chooses STREAM early.
-- Compare mode now runs 3 trials each and reports averages; csvstat runs exceeding 300s are DNF.
+- Compare mode runs 3 trials each and reports averages; csvstat runs exceeding 300s are DNF.
 
 ## Roadmap Ideas
 - Optional median / quantiles via t-digest or reservoir sampling.
